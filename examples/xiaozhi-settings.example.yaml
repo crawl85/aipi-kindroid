@@ -1,0 +1,8 @@
+# Merge these settings into the existing config. Replace the sample IP.
+server:
+  websocket: ws://192.168.1.42:8000/xiaozhi/v1/
+ASR:
+  SherpaASR:
+    model_type: sense_voice
+    # Enable only if your installed provider reads this setting.
+    # language: en

@@ -1,0 +1,330 @@
+diff --git a/main/boards/xorigin/aipi-lite/aipi-lite.cc b/main/boards/xorigin/aipi-lite/aipi-lite.cc
+index a257dfe..e4f4672 100644
+--- a/main/boards/xorigin/aipi-lite/aipi-lite.cc
++++ b/main/boards/xorigin/aipi-lite/aipi-lite.cc
+@@ -12,6 +12,7 @@
+ #include "button.h"
+ #include "codecs/es8311_audio_codec.h"
+ #include "config.h"
++#include "gamora_avatar.h"
+ #include "display/lcd_display.h"
+ #include "lamp_controller.h"
+ #include "led/single_led.h"
+@@ -23,6 +24,35 @@
+ 
+ #define TAG "AIPI-Lite"
+ 
++namespace {
++class AvatarDisplay final : public SpiLcdDisplay {
++public:
++    using SpiLcdDisplay::SpiLcdDisplay;
++
++    void SetupUI() override {
++        SpiLcdDisplay::SetupUI();
++        DisplayLockGuard lock(this);
++        if (lock && !avatar_attached_) {
++            gamora_avatar::Attach(lv_screen_active());
++            avatar_attached_ = true;
++        }
++    }
++
++private:
++    bool avatar_attached_ = false;
++};
++
++class AvatarAudioCodec final : public Es8311AudioCodec {
++public:
++    using Es8311AudioCodec::Es8311AudioCodec;
++
++    void OutputData(std::vector<int16_t>& data) override {
++        gamora_avatar::ObservePlayback(data.data(), data.size());
++        Es8311AudioCodec::OutputData(data);
++    }
++};
++}  // namespace
++
+ class AIPILite : public WifiBoard {
+    private:
+     i2c_master_bus_handle_t i2c_bus_;
+@@ -125,7 +155,7 @@ class AIPILite : public WifiBoard {
+         esp_lcd_panel_invert_color(panel_, DISPLAY_INVERT_COLOR);
+         esp_lcd_panel_swap_xy(panel_, DISPLAY_SWAP_XY);
+         esp_lcd_panel_mirror(panel_, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+-        display_ = new SpiLcdDisplay(panel_io, panel_, DISPLAY_WIDTH,
++        display_ = new AvatarDisplay(panel_io, panel_, DISPLAY_WIDTH,
+                                      DISPLAY_HEIGHT, DISPLAY_OFFSET_X,
+                                      DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                      DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+@@ -203,7 +233,7 @@ class AIPILite : public WifiBoard {
+     }
+ 
+     virtual AudioCodec* GetAudioCodec() override {
+-        static Es8311AudioCodec audio_codec(
++        static AvatarAudioCodec audio_codec(
+             i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE,
+             AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK,
+             AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+diff --git a/main/boards/xorigin/aipi-lite/gamora_avatar.cc b/main/boards/xorigin/aipi-lite/gamora_avatar.cc
+new file mode 100644
+index 0000000..c45ca0f
+--- /dev/null
++++ b/main/boards/xorigin/aipi-lite/gamora_avatar.cc
+@@ -0,0 +1,242 @@
++#include "gamora_avatar.h"
++
++#include "application.h"
++#include "board.h"
++#include "settings.h"
++
++#include <esp_heap_caps.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <lwip/inet.h>
++#include "src/misc/cache/instance/lv_image_cache.h"
++#include <cstring>
++#include "gamora_frames.h"
++#include "harley_frames.h"
++
++#include <esp_timer.h>
++#include <atomic>
++
++namespace gamora_avatar {
++namespace {
++constexpr uint32_t kTickMask = (1U << 30) - 1;
++constexpr uint32_t kFrameTimeoutMs = 145;
++constexpr uint32_t kSmallMouthLevel = 410;
++constexpr uint32_t kOpenMouthLevel = 1350;
++
++// Timestamp and frame travel together in a single nonblocking audio-to-UI write.
++std::atomic<uint32_t> last_mouth{0};
++uint32_t NowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
++
++constexpr lv_image_dsc_t MakeImage(const uint8_t* pixels, unsigned side = kAvatarSize) {
++    lv_image_dsc_t image{};
++    image.header.magic = LV_IMAGE_HEADER_MAGIC;
++    image.header.cf = LV_COLOR_FORMAT_RGB565;
++    image.header.w = side;
++    image.header.h = side;
++    image.header.stride = side * 2;
++    image.data_size = side * side * 2;
++    image.data = pixels;
++    return image;
++}
++
++constexpr lv_image_dsc_t kImages[] = {
++    MakeImage(kClosed),
++    MakeImage(kParted),
++    MakeImage(kOpen),
++    MakeImage(kBlink),
++};
++
++constexpr lv_image_dsc_t kHarleyImages[] = {
++    MakeImage(kHarleyClosed),
++    MakeImage(kHarleyParted),
++    MakeImage(kHarleyOpen),
++    MakeImage(kHarleyBlink),
++};
++std::atomic<bool> harley_selected{false};
++
++constexpr unsigned kPhotoSide = 128;
++constexpr size_t kPhotoBytes = kPhotoSide * kPhotoSide * 2;
++constexpr size_t kTokenBytes = 32;
++constexpr uint32_t kPhotoTimeMs = 8000;
++std::atomic<char*> pending_photo{nullptr};
++char* active_photo = nullptr;
++uint32_t photo_started = 0;
++lv_image_dsc_t photo_image{};
++
++std::string RelayEndpoint() {
++    const auto ota = Settings("wifi", false).GetString("ota_url");
++    if (!ota.starts_with("http://")) {
++        return {};
++    }
++    const auto host = ota.substr(7, ota.find_first_of(":/", 7) - 7);
++    in_addr address{};
++    if (inet_pton(AF_INET, host.c_str(), &address) != 1) {
++        return {};
++    }
++    const uint32_t ip = ntohl(address.s_addr);
++    if ((ip >> 24) != 10 && (ip >> 20) != 0xac1 && (ip >> 16) != 0xc0a8) {
++        return {};
++    }
++    return "http://" + host + ":8082/aipi/";
++}
++
++void FetchPhoto(std::string& token) {
++    const auto endpoint = RelayEndpoint();
++    if (endpoint.empty()) {
++        return;
++    }
++    auto* network = Board::GetInstance().GetNetwork();
++    if (network == nullptr) {
++        return;
++    }
++    auto http = network->CreateHttp(0);
++    http->SetTimeout(3500);
++    if (!http->Open("GET", endpoint + "image?after=" + token)) {
++        return;
++    }
++    auto status = http->GetStatusCode();
++    constexpr size_t size = kTokenBytes + kPhotoBytes;
++    if (!status || *status != 200 || http->GetBodyLength() != size) {
++        http->Close();
++        return;
++    }
++    auto* packet = static_cast<char*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM));
++    if (packet == nullptr) {
++        http->Close();
++        return;
++    }
++    size_t received = 0;
++    while (received < size) {
++        auto count = http->Read(packet + received, size - received);
++        if (!count || *count == 0) {
++            break;
++        }
++        received += *count;
++    }
++    http->Close();
++    if (received == size && strspn(std::string(packet, kTokenBytes).c_str(),
++                                  "0123456789abcdef") == kTokenBytes) {
++        token.assign(packet, kTokenBytes);
++        heap_caps_free(pending_photo.exchange(packet));
++    } else {
++        heap_caps_free(packet);
++    }
++}
++
++void FetchAvatar() {
++    const auto endpoint = RelayEndpoint();
++    auto* network = Board::GetInstance().GetNetwork();
++    if (endpoint.empty() || network == nullptr) {
++        return;
++    }
++    auto http = network->CreateHttp(0);
++    http->SetTimeout(2000);
++    if (!http->Open("GET", endpoint + "avatar")) {
++        return;
++    }
++    auto status = http->GetStatusCode();
++    if (status && *status == 200 && http->GetBodyLength() == 1) {
++        char selection = 0;
++        auto count = http->Read(&selection, 1);
++        if (count && *count == 1 && (selection == 'G' || selection == 'H')) {
++            harley_selected.store(selection == 'H');
++        }
++    }
++    http->Close();
++}
++
++void PhotoTask(void*) {
++    std::string token;
++    while (true) {
++        vTaskDelay(pdMS_TO_TICKS(5000));
++        if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
++            FetchAvatar();
++            if (pending_photo.load() == nullptr) {
++                FetchPhoto(token);
++            }
++        }
++    }
++}
++
++void Refresh(lv_timer_t* timer) {
++    auto* avatar = static_cast<lv_obj_t*>(lv_timer_get_user_data(timer));
++    const auto state = Application::GetInstance().GetDeviceState();
++    const bool show = state == kDeviceStateIdle || state == kDeviceStateListening ||
++                      state == kDeviceStateSpeaking;
++    const uint32_t now = NowMs();
++    const auto& images = harley_selected.load() ? kHarleyImages : kImages;
++    if (active_photo && (state != kDeviceStateIdle || now - photo_started >= kPhotoTimeMs)) {
++        lv_image_set_src(avatar, &images[0]);
++        lv_image_cache_drop(&photo_image);
++        heap_caps_free(active_photo);
++        active_photo = nullptr;
++    }
++    if (state == kDeviceStateIdle) {
++        if (active_photo == nullptr) {
++            active_photo = pending_photo.exchange(nullptr);
++            if (active_photo) {
++                photo_image = MakeImage(reinterpret_cast<const uint8_t*>(active_photo + kTokenBytes),
++                                        kPhotoSide);
++                lv_image_set_src(avatar, &photo_image);
++                photo_started = now;
++            }
++        }
++        if (active_photo) {
++            lv_obj_remove_flag(avatar, LV_OBJ_FLAG_HIDDEN);
++            return;
++        }
++    }
++    if (!show) {
++        lv_obj_add_flag(avatar, LV_OBJ_FLAG_HIDDEN);
++        return;
++    }
++
++    unsigned frame = 0;
++    if (state == kDeviceStateSpeaking) {
++        const uint32_t snapshot = last_mouth.load(std::memory_order_relaxed);
++        const uint32_t age = (now - (snapshot >> 2)) & kTickMask;
++        if (age < kFrameTimeoutMs) {
++            frame = snapshot & 3;
++        }
++    } else if (now % 4650 < 130) {
++        frame = 3;
++    }
++
++    if (lv_image_get_src(avatar) != &images[frame]) {
++        lv_image_set_src(avatar, &images[frame]);
++    }
++    lv_obj_remove_flag(avatar, LV_OBJ_FLAG_HIDDEN);
++}
++}  // namespace
++
++void Attach(lv_obj_t* screen) {
++    auto* avatar = lv_image_create(screen);
++    lv_image_set_src(avatar, &kImages[0]);
++    lv_obj_align(avatar, LV_ALIGN_CENTER, 0, 0);
++    lv_obj_remove_flag(avatar, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_add_flag(avatar, LV_OBJ_FLAG_HIDDEN);
++    lv_timer_create(Refresh, 30, avatar);
++    xTaskCreate(PhotoTask, "kindroid_photo", 6144, nullptr, 2, nullptr);
++}
++
++void ObservePlayback(const int16_t* samples, std::size_t count) {
++    if (Application::GetInstance().GetDeviceState() != kDeviceStateSpeaking || count == 0) {
++        last_mouth.store(0, std::memory_order_relaxed);
++        return;
++    }
++    // A stride of four keeps this lightweight on the audio output task.
++    uint32_t sum = 0;
++    for (std::size_t index = 0; index < count; index += 4) {
++        const int sample = samples[index];
++        sum += sample < 0 ? -sample : sample;
++    }
++    const auto mean = sum / ((count + 3) / 4);
++    unsigned frame = 0;
++    if (mean >= kOpenMouthLevel) {
++        frame = 2;
++    } else if (mean >= kSmallMouthLevel) {
++        frame = 1;
++    }
++    last_mouth.store((NowMs() << 2) | frame, std::memory_order_relaxed);
++}
++}  // namespace gamora_avatar
+diff --git a/main/boards/xorigin/aipi-lite/gamora_avatar.h b/main/boards/xorigin/aipi-lite/gamora_avatar.h
+new file mode 100644
+index 0000000..40b3ab0
+--- /dev/null
++++ b/main/boards/xorigin/aipi-lite/gamora_avatar.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <lvgl.h>
++#include <cstddef>
++#include <cstdint>
++
++namespace gamora_avatar {
++void Attach(lv_obj_t* screen);
++void ObservePlayback(const int16_t* samples, std::size_t count);
++}  // namespace gamora_avatar
